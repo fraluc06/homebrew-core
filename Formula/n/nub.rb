@@ -6,12 +6,29 @@ class Nub < Formula
   license "MIT"
 
   depends_on "cmake" => :build
-  depends_on "node" => :build
+  depends_on "node" => [:build, :test]
   depends_on "rust" => :build
 
   def install
-    cd "runtime" do
-      system "npm", "install", *std_npm_args(prefix: false)
+    # `runtime` has no package.json, so npm resolves up to the repository root
+    # either way. Install there, where package-lock.json pins the versions.
+    system "npm", "install", *std_npm_args(prefix: false)
+
+    # The `embed-runtime` feature tars `runtime` into the binary, and the tree that
+    # binary extracts at runtime has no parent node_modules to resolve through. Copy
+    # in the packages that tree loads: the transpile helpers and the web API
+    # polyfills. Without them the build still succeeds, but the binary fails to run
+    # any file that needs a helper and silently drops Temporal, URLPattern and
+    # Float16Array on Node versions that lack them natively.
+    %w[
+      @js-temporal/polyfill
+      @oxc-project/runtime
+      @petamoriken/float16
+      jsbi
+      urlpattern-polyfill
+    ].each do |dep|
+      (buildpath/"runtime/node_modules"/dep).dirname.mkpath
+      cp_r buildpath/"node_modules"/dep, buildpath/"runtime/node_modules"/dep
     end
 
     cd "crates/nub-native" do
@@ -34,6 +51,19 @@ class Nub < Formula
         "version": "1.0.0"
       }
     JSON
+
+    # Transpile a file that pulls a helper out of the vendored runtime node_modules.
+    # Legacy decorators are down-levelled on every Node version, so this covers the
+    # embedded runtime whichever Node is on PATH.
+    (testpath/"tsconfig.json").write <<~JSON
+      {"compilerOptions": {"experimentalDecorators": true, "emitDecoratorMetadata": true}}
+    JSON
+    (testpath/"decorated.ts").write <<~TYPESCRIPT
+      function log(target: any, key: string, descriptor: PropertyDescriptor) { return descriptor; }
+      class Greeter { @log greet(): string { return "hello nub"; } }
+      console.log(new Greeter().greet());
+    TYPESCRIPT
+    assert_equal "hello nub", shell_output("#{bin}/nub decorated.ts").strip
 
     system bin/"nub", "config", "set", "registry", "https://registry.npmjs.org"
     assert_match "https://registry.npmjs.org", shell_output("#{bin}/nub config get registry")
